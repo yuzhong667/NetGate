@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.d.netgate'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.d.netgate'
+        minSdk 26
+        targetSdk 34
+        versionCode 18
+        versionName '2.6'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    buildFeatures {
+        aidl true
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // Shizuku：以 shell(uid 2000) 身份执行 pm/am，用于结束进程
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+}

@@ -1,0 +1,23 @@
+# Gradle / IDEA
+.gradle/
+/build/
+/app/build/
+/local.properties
+*.iml
+/.idea/
+/.cxx/
+
+# 构建产物
+/dist/
+*.apk
+*.idsig
+*.aab
+
+# 签名文件：绝对不要提交
+*.jks
+*.keystore
+/keystore/
+
+# 系统
+.DS_Store
+Thumbs.db

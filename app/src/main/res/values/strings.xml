@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetGate</string>
+    <string name="accessibility_desc">用于识别当前打开的应用，并在加速器未连接或网络实际不通时提示并阻止继续使用。本服务不读取屏幕内容，只对指定地址做 TCP 连通性探测，不上传任何数据。</string>
+</resources>

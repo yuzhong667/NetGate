@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- 内页弹窗：白底、蓝色强调色，和主界面同一套语言 -->
+    <style name="NetGateDialog" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">#0A84FF</item>
+        <item name="android:colorPrimary">#0A84FF</item>
+        <item name="android:colorEdgeEffect">#0A84FF</item>
+        <item name="android:textColorAlertDialogListItem">#1C1C1E</item>
+    </style>
+
+</resources>
