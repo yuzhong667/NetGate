@@ -360,7 +360,7 @@ public final class NetworkGate {
 
             // TLS 通了还不够，必须拿到应用层响应，排除“假 TLS 端点”
             String req = "HEAD / HTTP/1.1\r\nHost: " + t.host + "\r\n"
-                    + "User-Agent: NetGate/2.6\r\nConnection: close\r\n\r\n";
+                    + "User-Agent: NetGate/2.8\r\nConnection: close\r\n\r\n";
             ssl.getOutputStream().write(req.getBytes(StandardCharsets.US_ASCII));
             ssl.getOutputStream().flush();
 

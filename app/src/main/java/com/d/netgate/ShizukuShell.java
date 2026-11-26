@@ -13,6 +13,8 @@ import android.os.Parcel;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import rikka.shizuku.Shizuku;
 import rikka.shizuku.ShizukuBinderWrapper;
@@ -418,6 +420,24 @@ public final class ShizukuShell {
                 + " 2>&1; echo \"exit=$?\"");
         Diag.log("取消挂起 " + safe + " · " + r.replace('\n', ' ').trim());
         return r;
+    }
+
+    private static final Pattern PKG_SLASH = Pattern.compile(
+            "([A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+)/[A-Za-z0-9_.$]+");
+
+    /**
+     * 当前前台包名，读不到返回空串。
+     *
+     * shell 持有 REAL_GET_TASKS，不需要无障碍也能看到任务栈。
+     * Android 10 之后是 topResumedActivity=，更早是 mResumedActivity:，两个都认。
+     * 一次 dumpsys 约 200~400ms，调用方必须放在工作线程，别在主线程用。
+     */
+    public static String foregroundPackage() {
+        String out = execSync("/system/bin/dumpsys activity activities 2>/dev/null"
+                + " | grep -m1 -E \"topResumedActivity=|mResumedActivity:\"");
+        if (out == null || out.isEmpty()) return "";
+        Matcher m = PKG_SLASH.matcher(out);
+        return m.find() ? m.group(1) : "";
     }
 
     /** 同步执行一条 shell 命令，返回合并后的输出（仅供诊断用）。 */

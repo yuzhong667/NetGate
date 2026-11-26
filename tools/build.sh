@@ -7,7 +7,7 @@
 #
 # 用法：
 #   ANDROID_SDK_ROOT=~/android-sdk ./tools/build.sh
-#   ./tools/build.sh --sdk ~/android-sdk --version-name 2.6 --version-code 17
+#   ./tools/build.sh --sdk ~/android-sdk --version-name 2.9 --version-code 21
 #
 # 需要的 SDK 组件：platforms;android-34、build-tools;34.0.0（更新版本也行）
 # Shizuku 的 4 个 AAR 会在首次构建时从 Maven Central 下载到 build/libs/。
@@ -19,8 +19,8 @@ APP="$ROOT/app/src/main"
 OUT="$ROOT/build"
 DIST="$ROOT/dist"
 
-VERSION_NAME="${VERSION_NAME:-2.6}"
-VERSION_CODE="${VERSION_CODE:-18}"
+VERSION_NAME="${VERSION_NAME:-2.10}"
+VERSION_CODE="${VERSION_CODE:-22}"
 PKG="com.d.netgate"
 AIDL="$APP/aidl/com/d/netgate/IUserService.aidl"
 SHIZUKU_VER="13.1.5"

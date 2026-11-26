@@ -22,6 +22,10 @@ public final class Prefs {
     private static final String KEY_LEVEL = "level";
     private static final String KEY_DISABLED = "disabled_pkgs";
     private static final String KEY_HARD = "hard_block";
+    private static final String KEY_SHELL_GUARD = "shell_guard";
+    private static final String KEY_NODE_REGION = "node_region";
+    private static final String KEY_NODE_LABEL = "node_label";
+    private static final String KEY_NODE_GUARDED = "node_guarded";
 
     private Prefs() {
     }
@@ -66,7 +70,13 @@ public final class Prefs {
                 if (p != null && !p.isEmpty() && !SysApps.isCritical(c, p)) clean.add(p);
             }
         }
-        sp(c).edit().putStringSet(KEY_GUARDED, clean).apply();
+        // 节点锁名单必须是受保护名单的子集：取消保护的同时解除节点约束
+        Set<String> bound = nodeGuarded(c);
+        bound.retainAll(clean);
+        sp(c).edit()
+                .putStringSet(KEY_GUARDED, clean)
+                .putStringSet(KEY_NODE_GUARDED, bound)
+                .apply();
     }
 
     public static boolean kill(Context c) {
@@ -222,6 +232,79 @@ public final class Prefs {
 
     public static void setHardBlock(Context c, boolean value) {
         sp(c).edit().putBoolean(KEY_HARD, value).apply();
+    }
+
+    /** 无障碍失效时是否用 Shizuku 通道接管前台监听。 */
+    public static boolean shellGuard(Context c) {
+        return sp(c).getBoolean(KEY_SHELL_GUARD, false);
+    }
+
+    public static void setShellGuard(Context c, boolean value) {
+        sp(c).edit().putBoolean(KEY_SHELL_GUARD, value).apply();
+    }
+
+    // ------------------------------------------------------------------ 节点锁
+
+    /**
+     * 受保护应用分两层：
+     *
+     *   - 普通受保护：只要加速器通就行；
+     *   - 节点约束（{@link #nodeGuarded}）：还要求出口是锁定地区。
+     *
+     * 这里只存"哪些应用受节点约束"，是否生效取决于名单非空且已锁定地区。
+     */
+    public static Set<String> nodeGuarded(Context c) {
+        return new HashSet<>(sp(c).getStringSet(KEY_NODE_GUARDED,
+                Collections.<String>emptySet()));
+    }
+
+    public static void setNodeGuarded(Context c, Set<String> pkgs) {
+        Set<String> clean = new HashSet<>();
+        if (pkgs != null) {
+            for (String p : pkgs) {
+                if (p != null && !p.isEmpty() && !SysApps.isCritical(c, p)) clean.add(p);
+            }
+        }
+        // 只允许已受保护的应用进入节点名单
+        clean.retainAll(guarded(c));
+        sp(c).edit().putStringSet(KEY_NODE_GUARDED, clean).apply();
+    }
+
+    /** 这个应用是否被节点锁约束。 */
+    public static boolean nodeBound(Context c, String pkg) {
+        return pkg != null && !pkg.isEmpty() && nodeGuarded(c).contains(pkg);
+    }
+
+    public static boolean nodeActive(Context c) {
+        return !nodeGuarded(c).isEmpty() && !nodeRegion(c).isEmpty();
+    }
+
+    /** 锁定的国家码，如 JP；空串表示还没锁定。 */
+    public static String nodeRegion(Context c) {
+        return sp(c).getString(KEY_NODE_REGION, "");
+    }
+
+    /** 展示用的名字，如「日本 · 东京 (NRT)」。 */
+    public static String nodeLabel(Context c) {
+        return sp(c).getString(KEY_NODE_LABEL, "");
+    }
+
+    public static boolean hasNodeRule(Context c) {
+        return !nodeRegion(c).isEmpty();
+    }
+
+    public static void setNodeRule(Context c, String region, String label) {
+        sp(c).edit()
+                .putString(KEY_NODE_REGION, region == null ? "" : region)
+                .putString(KEY_NODE_LABEL, label == null ? "" : label)
+                .apply();
+    }
+
+    public static void clearNodeRule(Context c) {
+        sp(c).edit()
+                .remove(KEY_NODE_REGION)
+                .remove(KEY_NODE_LABEL)
+                .apply();
     }
 
     public static Set<String> disabled(Context c) {

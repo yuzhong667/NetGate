@@ -39,6 +39,8 @@ public class AppPickerActivity extends Activity {
 
     private AppAdapter adapter;
     private TextView countView;
+    /** true = 选「限定节点」的应用（只列已受保护的），false = 选受保护应用。 */
+    private boolean nodeMode;
 
     static class AppEntry {
         String pkg;
@@ -57,10 +59,17 @@ public class AppPickerActivity extends Activity {
                 View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
                         | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         SysApps.refresh();
-        selected.addAll(Prefs.guarded(this));
-        // 历史版本可能已经把桌面之类写进了名单，这里顺手清掉
-        boolean dirty = selected.removeIf(p -> SysApps.isCritical(this, p));
-        if (dirty) Prefs.setGuarded(this, selected);
+        nodeMode = "node".equals(getIntent().getStringExtra("mode"));
+        if (nodeMode) {
+            // 只列已受保护的应用，且历史脏数据在这里收敛一次
+            selected.addAll(Prefs.nodeGuarded(this));
+            selected.retainAll(Prefs.guarded(this));
+        } else {
+            selected.addAll(Prefs.guarded(this));
+            // 历史版本可能已经把桌面之类写进了名单，这里顺手清掉
+            boolean dirty = selected.removeIf(p -> SysApps.isCritical(this, p));
+            if (dirty) Prefs.setGuarded(this, selected);
+        }
         buildUi();
         loadApps();
     }
@@ -89,7 +98,8 @@ public class AppPickerActivity extends Activity {
         bp.rightMargin = dp(4);
         topRow.addView(backWrap, bp);
 
-        TextView title = Ui.text(this, "选择应用", 24, Ui.INK, true);
+        TextView title = Ui.text(this, nodeMode ? "节点锁应用" : "选择应用",
+                24, Ui.INK, true);
         topRow.addView(title, new LinearLayout.LayoutParams(0, -2, 1f));
 
         countView = Ui.text(this, "", 12, Ui.SUB, false);
@@ -98,7 +108,9 @@ public class AppPickerActivity extends Activity {
         topRow.addView(countView);
         header.addView(topRow);
 
-        TextView tip = Ui.text(this, "勾选需要限制的应用 · 置灰的是系统关键应用，不可选",
+        TextView tip = Ui.text(this, nodeMode
+                        ? "勾选的应用只能在锁定的节点下打开 · 其余应用不受限制"
+                        : "勾选需要限制的应用 · 置灰的是系统关键应用，不可选",
                 12, Ui.SUB, false);
         header.addView(tip, topMargin(7));
 
@@ -138,7 +150,19 @@ public class AppPickerActivity extends Activity {
         list.setVerticalScrollBarEnabled(false);
         adapter = new AppAdapter();
         list.setAdapter(adapter);
-        root.addView(list, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        TextView empty = Ui.text(this, nodeMode
+                        ? "还没有受保护应用\n先去「受保护应用」里选几个"
+                        : "没有匹配的应用",
+                13, Ui.SUB, false);
+        empty.setGravity(Gravity.CENTER);
+        empty.setLineSpacing(dp(4), 1f);
+
+        FrameLayout listWrap = new FrameLayout(this);
+        listWrap.addView(list, new FrameLayout.LayoutParams(-1, -1));
+        listWrap.addView(empty, new FrameLayout.LayoutParams(-1, -2, Gravity.CENTER));
+        list.setEmptyView(empty);
+        root.addView(listWrap, new LinearLayout.LayoutParams(-1, 0, 1f));
 
         updateCount();
     }
@@ -160,6 +184,7 @@ public class AppPickerActivity extends Activity {
                 String pkg = ri.activityInfo.packageName;
                 if (pkg.equals(getPackageName()) || seen.contains(pkg)) continue;
                 seen.add(pkg);
+                if (nodeMode && !Prefs.guarded(AppPickerActivity.this).contains(pkg)) continue;
                 AppEntry e = new AppEntry();
                 e.pkg = pkg;
                 try {
@@ -201,7 +226,9 @@ public class AppPickerActivity extends Activity {
     }
 
     private void updateCount() {
-        if (countView != null) countView.setText("已选 " + selected.size() + " 个");
+        if (countView != null) {
+            countView.setText((nodeMode ? "已绑 " : "已选 ") + selected.size() + " 个");
+        }
     }
 
     /** 分组列表：首行圆上角、末行圆下角，中间是白底 + 左侧缩进的分隔线。 */
@@ -305,7 +332,8 @@ public class AppPickerActivity extends Activity {
                 if (e.critical) return;
                 if (checked) selected.add(e.pkg);
                 else selected.remove(e.pkg);
-                Prefs.setGuarded(AppPickerActivity.this, selected);
+                if (nodeMode) Prefs.setNodeGuarded(AppPickerActivity.this, selected);
+                else Prefs.setGuarded(AppPickerActivity.this, selected);
                 updateCount();
             });
 

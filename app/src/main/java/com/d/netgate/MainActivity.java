@@ -37,6 +37,7 @@ import rikka.shizuku.Shizuku;
 
 public class MainActivity extends Activity {
 
+    private static final int REQ_NOTIF = 0x51D;
     private static final int REQ_SHIZUKU = 1001;
 
     private static final int BG = Ui.BG;
@@ -71,6 +72,9 @@ public class MainActivity extends Activity {
     private Glyph netGlyph;
     private TextView netTitle;
     private TextView netSub;
+    private TextView nodeValue;
+    private TextView nodeSub;
+    private TextView nodeExit;
     private TextView netRtt;
     private TextView netRttUnit;
     private LinearLayout targetList;
@@ -130,6 +134,15 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         ShizukuShell.init(this);
+        // 服务可能被 ColorOS 清掉，回到前台时补一次
+        if (Prefs.shellGuard(this) && !ShellGuardService.running) {
+            ShellGuardService.start(this);
+        }
+        // 卡片上要显示「当前出口」；没有加速器通道时读也没用，白耗流量
+        if (NetworkGate.hasVpn(this)
+                && (Prefs.hasNodeRule(this) || !Prefs.nodeGuarded(this).isEmpty())) {
+            refreshExitAsync();
+        }
         refresh();
         uiHandler.removeCallbacks(uiTick);
         uiHandler.postDelayed(uiTick, 1500);
@@ -357,6 +370,63 @@ public class MainActivity extends Activity {
         netFoot.addView(detailLink);
         netCard.addView(netFoot, new LinearLayout.LayoutParams(-1, -2));
 
+        // ---------------------------------------------------------- 节点锁
+        Ui.ShadowCard nodeCard = new Ui.ShadowCard(this);
+        nodeCard.radius(19);
+        nodeCard.depth(2.2f, 0x14000000);
+        nodeCard.bg(Ui.CARD);
+        nodeCard.setPadding(dp(14), dp(12), dp(14), 0);
+        root.addView(nodeCard, lpTop(-1, -2, 12));
+
+        LinearLayout nodeTop = new LinearLayout(this);
+        nodeTop.setOrientation(LinearLayout.HORIZONTAL);
+        nodeTop.setGravity(Gravity.CENTER_VERTICAL);
+
+        FrameLayout nodeIco = new FrameLayout(this);
+        nodeIco.setBackground(Ui.grad(0xFFFFF3E2, 0xFFFFE6C9, 11, this));
+        Glyph nodeGlyph = new Glyph(this);
+        nodeGlyph.type(Glyph.BOLT).color(Ui.AMBER_DEEP).weight(2.1f);
+        nodeIco.addView(nodeGlyph,
+                new FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER));
+        nodeTop.addView(nodeIco, new LinearLayout.LayoutParams(dp(36), dp(36)));
+
+        LinearLayout nodeMeta = new LinearLayout(this);
+        nodeMeta.setOrientation(LinearLayout.VERTICAL);
+        TextView nodeTitle = Ui.text(this, "节点锁", 14, Ui.INK, true);
+        nodeTitle.setSingleLine(true);
+        nodeMeta.addView(nodeTitle);
+        nodeSub = Ui.text(this, "未启用 · 任意节点均可", 11, Ui.SUB, false);
+        nodeSub.setSingleLine(true);
+        nodeSub.setEllipsize(TextUtils.TruncateAt.END);
+        nodeMeta.addView(nodeSub, lpTop(-1, -2, 3));
+
+        LinearLayout.LayoutParams nodeMp = new LinearLayout.LayoutParams(0, -2, 1f);
+        nodeMp.leftMargin = dp(11);
+        nodeTop.addView(nodeMeta, nodeMp);
+
+        nodeValue = Ui.text(this, "选择 ›", 12, Ui.SUB, false);
+        nodeTop.addView(nodeValue);
+        nodeCard.addView(nodeTop, new LinearLayout.LayoutParams(-1, -2));
+        nodeCard.setOnClickListener(v -> showNodeDialog());
+
+        View nodeLine = new View(this);
+        nodeLine.setBackgroundColor(Ui.LINE);
+        LinearLayout.LayoutParams nodeLp = new LinearLayout.LayoutParams(-1, dp(1));
+        nodeLp.topMargin = dp(10);
+        nodeCard.addView(nodeLine, nodeLp);
+
+        LinearLayout nodeFoot = new LinearLayout(this);
+        nodeFoot.setOrientation(LinearLayout.HORIZONTAL);
+        nodeFoot.setGravity(Gravity.CENTER_VERTICAL);
+        nodeFoot.setPadding(0, dp(11), 0, dp(12));
+
+        // 这一行只做信息展示：整张卡片已经是一个入口，再放「设置」就重复了
+        nodeExit = Ui.text(this, "当前出口 · 未知", 11, Ui.SUB, false);
+        nodeExit.setSingleLine(true);
+        nodeExit.setEllipsize(TextUtils.TruncateAt.END);
+        nodeFoot.addView(nodeExit, new LinearLayout.LayoutParams(0, -2, 1f));
+        nodeCard.addView(nodeFoot, new LinearLayout.LayoutParams(-1, -2));
+
         // ---------------------------------------------------------- 设置组
         Ui.ShadowCard group = new Ui.ShadowCard(this);
         group.radius(19);
@@ -413,6 +483,20 @@ public class MainActivity extends Activity {
         hardSwitch.setOnCheckedChangeListener((b, checked) -> Prefs.setHardBlock(this, checked));
         addSwitchRow(toggles, "强停无效时挂起应用",
                 "最后的兜底：图标会变灰，网络恢复后自动还原", hardSwitch);
+        addDivider(toggles);
+
+        Switch shellSwitch = switchFor(Prefs.shellGuard(this));
+        shellSwitch.setOnCheckedChangeListener((b, checked) -> {
+            Prefs.setShellGuard(this, checked);
+            if (checked) {
+                ensureNotifPermission();
+                ShellGuardService.start(this);
+            } else {
+                ShellGuardService.stop(this);
+            }
+        });
+        addSwitchRow(toggles, "Shizuku 前台监听",
+                "无障碍被撤销时接管 · 提示降级为通知", shellSwitch);
 
         // -------------------------------------------------------- 运行状态
         TextView stHead = Ui.text(this, "运行状态", 13, Ui.SUB, true);
@@ -503,6 +587,353 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------ 主界面零件
+
+    // -------------------------------------------------------------- 节点锁
+
+    /**
+     * 国内常用节点地区。
+     *
+     * 加速器不会把「当前是日本 01」告诉系统，只能靠出口 IP 反查国家；
+     * 反查失败时不能让用户卡死，所以这里给一份固定表，手动指定即可。
+     */
+    private static final String[][] NODE_REGIONS = {
+            {"JP", "日本"}, {"HK", "中国香港"}, {"TW", "中国台湾"},
+            {"SG", "新加坡"}, {"KR", "韩国"}, {"US", "美国"},
+            {"GB", "英国"}, {"DE", "德国"}, {"NL", "荷兰"},
+            {"CA", "加拿大"}, {"AU", "澳大利亚"}, {"TH", "泰国"},
+            {"MY", "马来西亚"}, {"VN", "越南"}, {"TR", "土耳其"},
+            {"AE", "阿联酋"}, {"RU", "俄罗斯"}, {"BR", "巴西"},
+    };
+
+    /** 弹窗里选中的地区，读出口成功时自动填一次，用户点过之后就不再覆盖。 */
+    private static final class NodePick {
+        String sel;
+        boolean touched;
+
+        NodePick(String s) {
+            sel = s == null ? "" : s;
+        }
+    }
+
+    private interface ExitSink {
+        void onExit(NodeLock.Exit e);
+    }
+
+    private void updateNodeCard() {
+        if (nodeSub == null) return;
+        int n = Prefs.nodeGuarded(this).size();
+        boolean has = Prefs.hasNodeRule(this);
+
+        String sub;
+        if (n == 0) {
+            sub = "未指定应用 · 普通保护不受限";
+        } else if (!has) {
+            sub = n + " 个应用待锁定节点";
+        } else {
+            sub = n + " 个应用只走 " + Prefs.nodeLabel(this);
+        }
+        nodeSub.setText(sub);
+        nodeSub.setTextColor(n > 0 && !has ? Ui.AMBER_DEEP : Ui.SUB);
+        if (nodeValue != null) {
+            nodeValue.setText(has ? "已锁定 ›" : "选择 ›");
+        }
+
+        NodeLock.Exit e = NodeLock.cached();
+        boolean mismatch = has && e != null && e.usable()
+                && !Prefs.nodeRegion(this).equalsIgnoreCase(e.loc);
+        nodeExit.setText(exitLine());
+        nodeExit.setTextColor(mismatch ? Ui.RED_DEEP : Ui.SUB);
+    }
+
+    private String exitLine() {
+        NodeLock.Exit e = NodeLock.cached();
+        if (e == null) {
+            if (!NetworkGate.hasVpn(this)) return "当前出口 · 未连接加速器";
+            return NodeLock.lastFailAt() > 0 ? "当前出口 · 读取失败" : "当前出口 · 未读取";
+        }
+        String s = "当前出口 " + e.tag();
+        if (!e.viaVpn) s += " · 未走隧道";
+        if (Prefs.hasNodeRule(this) && e.usable()
+                && !Prefs.nodeRegion(this).equalsIgnoreCase(e.loc)) {
+            s += " · 与锁定不符";
+        }
+        return s;
+    }
+
+    private String exitMeta(NodeLock.Exit e) {
+        StringBuilder sb = new StringBuilder();
+        if (e.ip != null) sb.append(e.ip);
+        if (e.colo != null && !e.colo.isEmpty()) sb.append("   ·   ").append(e.colo);
+        sb.append(e.viaVpn ? "   ·   已走隧道" : "   ·   未走隧道");
+        return sb.toString();
+    }
+
+    private void refreshExitAsync() {
+        readExitAsync(null);
+    }
+
+    /** 后台读一次出口，结果回主线程；e 为 null 表示这次没读到（保留旧缓存）。 */
+    private void readExitAsync(final ExitSink sink) {
+        new Thread(() -> {
+            NodeLock.Exit e = null;
+            try {
+                e = NodeLock.refresh(this);
+            } catch (Throwable ignored) {
+            }
+            final NodeLock.Exit r = e;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                updateNodeCard();
+                if (sink != null) sink.onExit(r);
+            });
+        }, "netgate-node-ui").start();
+    }
+
+    private void showNodeDialog() {
+        final NodeLock.Exit cached = NodeLock.cached();
+        final boolean has = Prefs.hasNodeRule(this);
+        final int n = Prefs.nodeGuarded(this).size();
+        // 已锁定的地区优先；没锁过就用刚读到的出口预选，用户点过之后不再自动改
+        final NodePick pick = new NodePick(has ? Prefs.nodeRegion(this)
+                : (cached != null && cached.usable() ? cached.loc : ""));
+        // 已经有规则时，自动读到的出口不能顶掉它（否则一开一关就把规则改了）
+        pick.touched = has;
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(4), dp(20), dp(4));
+
+        // ---------------------------------------------------------- 当前出口
+        LinearLayout now = new LinearLayout(this);
+        now.setOrientation(LinearLayout.VERTICAL);
+        now.setBackground(Ui.round(0xFFF7F7FA, 14, this));
+        now.setPadding(dp(14), dp(12), dp(14), dp(12));
+
+        LinearLayout nowHead = new LinearLayout(this);
+        nowHead.setOrientation(LinearLayout.HORIZONTAL);
+        nowHead.setGravity(Gravity.CENTER_VERTICAL);
+        nowHead.addView(Ui.text(this, "当前出口", 11, Ui.SUB2, true),
+                new LinearLayout.LayoutParams(0, -2, 1f));
+        TextView reRead = Ui.text(this, "重新读取 ›", 11, Ui.BLUE, true);
+        nowHead.addView(reRead);
+        now.addView(nowHead);
+
+        final TextView exitWhere = Ui.text(this,
+                cached == null ? (NodeLock.lastFailAt() > 0 ? "读取失败" : "未读取")
+                        : cached.where(),
+                18, Ui.INK, true);
+        now.addView(exitWhere, lpTop(-1, -2, 5));
+
+        final TextView exitMeta = Ui.text(this,
+                cached == null ? "读不到也没关系，在下面直接选国家" : exitMeta(cached),
+                11, Ui.SUB, false);
+        now.addView(exitMeta, lpTop(-1, -2, 4));
+        box.addView(now, new LinearLayout.LayoutParams(-1, -2));
+
+        // ------------------------------------------------------------ 地区选择
+        final TextView ruleText = Ui.text(this, ruleLine(pick.sel), 13,
+                pick.sel.isEmpty() ? Ui.AMBER_DEEP : Ui.INK, true);
+        box.addView(ruleText, lpTop(-1, -2, 14));
+
+        final LinearLayout grid = new LinearLayout(this);
+        grid.setOrientation(LinearLayout.VERTICAL);
+        box.addView(grid, lpTop(-1, -2, 6));
+        fillRegions(grid, pick, cached, ruleText);
+
+        // -------------------------------------------------------- 应用名单入口
+        LinearLayout apps = new LinearLayout(this);
+        apps.setOrientation(LinearLayout.HORIZONTAL);
+        apps.setGravity(Gravity.CENTER_VERTICAL);
+        apps.setBackground(Ui.round(0xFFFFFFFF, 12, this));
+        apps.setPadding(dp(13), dp(12), dp(13), dp(12));
+        apps.setClickable(true);
+        TextView apLabel = Ui.text(this, "限定节点的应用", 13, Ui.INK, false);
+        apps.addView(apLabel, new LinearLayout.LayoutParams(0, -2, 1f));
+        TextView apValue = Ui.text(this, n + " 个 ›", 13, Ui.BLUE, true);
+        apps.addView(apValue);
+        apps.setOnClickListener(v -> {
+            Intent i = new Intent(this, AppPickerActivity.class);
+            i.putExtra("mode", "node");
+            startActivity(i);
+        });
+        box.addView(apps, lpTop(-1, -2, 14));
+
+        TextView note = Ui.text(this,
+                "只有这里选中的应用受节点限制；其余受保护应用只要加速器通就能用。\n"
+                        + "判定只看国家，不看 IP——出口 IP 每天都会被运营商重新分配。\n"
+                        + "读不到出口时无法比对，这一轮先放行；地区照旧保存，下次读到就按它判定。",
+                11, 0xFF7C7C85, false);
+        note.setLineSpacing(dp(4), 1f);
+        box.addView(note, lpTop(-1, -2, 10));
+
+        if (cached != null) {
+            box.addView(Ui.text(this, "最近几次出口", 11, Ui.SUB2, true),
+                    lpTop(-1, -2, 14));
+            TextView h = Ui.text(this, NodeLock.historyText(), 11, 0xFF7C7C85, false);
+            h.setLineSpacing(dp(3), 1f);
+            box.addView(h, lpTop(-1, -2, 5));
+        }
+
+        ScrollView sv = new ScrollView(this);
+        sv.addView(box, new FrameLayout.LayoutParams(-1, -2));
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this, R.style.NetGateDialog)
+                .setTitle("节点锁")
+                .setView(sv)
+                .setNegativeButton("关闭", null);
+
+        if (has) {
+            b.setNeutralButton("解除锁定", (d, w) -> {
+                Prefs.clearNodeRule(this);
+                updateNodeCard();
+                toast("已解除节点锁定，应用恢复为普通保护");
+            });
+        }
+        b.setPositiveButton("锁定", null);
+
+        // 打开弹窗就试读一次：之前「读取中…」永远不动，用户只能干等
+        final boolean fresh = cached != null
+                && System.currentTimeMillis() - cached.at < 15000;
+        if (!fresh && !NetworkGate.hasVpn(this) && cached == null) {
+            exitWhere.setText("未连接加速器");
+            exitMeta.setText("连上后会自动读取；现在也可以直接在下面选国家");
+        } else if (!fresh) {
+            if (cached == null) {
+                exitWhere.setText("读取中…");
+                exitMeta.setText("正在请求出口指纹，读不到也可以在下面手动选");
+            }
+            readExitAsync(e -> {
+                if (e == null) showReadFail(exitWhere, exitMeta);
+                else {
+                    exitWhere.setText(e.where());
+                    exitMeta.setText(exitMeta(e));
+                    if (!pick.touched) pick.sel = e.loc;
+                    fillRegions(grid, pick, e, ruleText);
+                    ruleText.setText(ruleLine(pick.sel));
+                    ruleText.setTextColor(pick.sel.isEmpty() ? Ui.AMBER_DEEP : Ui.INK);
+                }
+            });
+        }
+
+        final AlertDialog d = dlg(b);
+        d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String sel = pick.sel;
+            if (sel == null || sel.isEmpty()) {
+                toast("先在上面选一个国家");
+                return;
+            }
+            if (!NetworkGate.hasVpn(this)) {
+                toast("当前没有加速器通道，锁节点暂时不会生效");
+            }
+            Prefs.setNodeRule(this, sel, NodeLock.countryName(sel));
+            updateNodeCard();
+            toast("已锁定 " + NodeLock.countryName(sel)
+                    + (n == 0 ? " · 记得勾选要限定的应用" : ""));
+            d.dismiss();
+        });
+
+        reRead.setOnClickListener(v -> {
+            exitWhere.setText("读取中…");
+            exitMeta.setText("正在请求出口指纹…");
+            readExitAsync(e -> {
+                if (e == null) {
+                    showReadFail(exitWhere, exitMeta);
+                    return;
+                }
+                exitWhere.setText(e.where());
+                exitMeta.setText(exitMeta(e));
+                pick.touched = false;
+                pick.sel = e.loc;
+                fillRegions(grid, pick, e, ruleText);
+                ruleText.setText(ruleLine(pick.sel));
+                ruleText.setTextColor(Ui.INK);
+            });
+        });
+    }
+
+    /** 读取失败时别把上一次的结果抹掉——那仍然是当前最有用的信息。 */
+    private void showReadFail(TextView where, TextView meta) {
+        NodeLock.Exit last = NodeLock.cached();
+        if (last != null) {
+            where.setText(last.where());
+            meta.setText("刚才没读到 · 这是上次的结果");
+            return;
+        }
+        where.setText("读取失败");
+        meta.setText(NetworkGate.hasVpn(this)
+                ? "加速器没返回出口信息，在下面直接选国家即可"
+                : "当前没有加速器通道，在下面直接选国家即可");
+    }
+
+    private String ruleLine(String sel) {
+        if (sel == null || sel.isEmpty()) return "未锁定 · 选一个国家";
+        String name = NodeLock.countryName(sel);
+        return Prefs.nodeRegion(this).equalsIgnoreCase(sel)
+                ? "已锁定：" + name : "将锁定到：" + name;
+    }
+
+    /** 三列地区按钮；读到的国家不在表里时临时补一个。 */
+    private void fillRegions(final LinearLayout grid, final NodePick pick,
+                             final NodeLock.Exit e, final TextView ruleText) {
+        grid.removeAllViews();
+
+        List<String[]> items = new ArrayList<>();
+        Collections.addAll(items, NODE_REGIONS);
+        if (e != null && e.usable() && e.loc != null && !e.loc.isEmpty()) {
+            boolean known = false;
+            for (String[] r : items) {
+                if (r[0].equalsIgnoreCase(e.loc)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) items.add(new String[]{e.loc, NodeLock.countryName(e.loc)});
+        }
+
+        LinearLayout row = null;
+        for (int i = 0; i < items.size(); i++) {
+            if (i % 3 == 0) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                grid.addView(row, lpTop(-1, -2, i == 0 ? 0 : 8));
+            }
+            final String code = items.get(i)[0];
+            final String name = items.get(i)[1];
+            boolean on = code.equalsIgnoreCase(pick.sel);
+
+            TextView chip = Ui.text(this, name, 12, on ? Ui.BLUE : Ui.TEXT, on);
+            chip.setGravity(Gravity.CENTER);
+            chip.setSingleLine(true);
+            chip.setBackground(on
+                    ? Ui.stroke(0xFFEAF3FF, 11, 1.2f, 0x660A84FF, this)
+                    : Ui.round(0xFFF4F4F8, 11, this));
+            chip.setPadding(0, dp(9), 0, dp(9));
+            chip.setOnClickListener(v -> {
+                pick.sel = code;
+                pick.touched = true;
+                fillRegions(grid, pick, e, ruleText);
+                ruleText.setText(ruleLine(pick.sel));
+                ruleText.setTextColor(Ui.INK);
+            });
+
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(0, -2, 1f);
+            cp.leftMargin = i % 3 == 0 ? 0 : dp(4);
+            cp.rightMargin = i % 3 == 2 ? 0 : dp(4);
+            row.addView(chip, cp);
+        }
+
+        // 最后一行不满三个：补空位，别把剩下的按钮拉宽
+        int rem = items.size() % 3;
+        if (row != null && rem != 0) {
+            for (int i = rem; i < 3; i++) {
+                View gap = new View(this);
+                LinearLayout.LayoutParams gp = new LinearLayout.LayoutParams(0, 1, 1f);
+                gp.leftMargin = i == 0 ? 0 : dp(4);
+                gp.rightMargin = i == 2 ? 0 : dp(4);
+                row.addView(gap, gp);
+            }
+        }
+    }
 
     private TextView addSettingRow(LinearLayout parent, int glyphType,
                                    int bgTop, int bgBottom, int glyphColor,
@@ -641,6 +1072,7 @@ public class MainActivity extends Activity {
         if (accValue == null) return;
         refreshStatusOnly();
         updateProbeRows();
+        updateNodeCard();
     }
 
     /** 只刷新状态行，不重建列表 —— 供 2 秒一次的定时器调用。 */
@@ -1133,7 +1565,7 @@ public class MainActivity extends Activity {
             hb = age + " 秒前（正常）";
         }
 
-        sb.append("版本：2.6 (18)\n");
+        sb.append("版本：2.9 (21)\n");
         sb.append("结论：");
         if (!acc) {
             sb.append("无障碍服务没开，打开应用时没有任何东西在拦\n");
@@ -1752,6 +2184,17 @@ public class MainActivity extends Activity {
 
     private int dp(int v) {
         return Math.round(getResources().getDisplayMetrics().density * v);
+    }
+
+    /** Android 13 起前台服务的通知要单独授权，没给的话通知栏是空的。 */
+    private void ensureNotifPermission() {
+        if (android.os.Build.VERSION.SDK_INT < 33) return;
+        try {
+            if (checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                    == PackageManager.PERMISSION_GRANTED) return;
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIF);
+        } catch (Throwable ignored) {
+        }
     }
 
     private void toast(String s) {

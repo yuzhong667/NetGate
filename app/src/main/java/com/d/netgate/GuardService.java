@@ -42,6 +42,8 @@ public class GuardService extends AccessibilityService {
 
     private static final int R_NO_VPN = 0;
     private static final int R_UNREACHABLE = 1;
+    /** 连通正常，但出口节点不是锁定允许的那个。 */
+    private static final int R_NODE = 2;
 
     private static final long TICK_BUSY = 800;
     private static final long TICK_WATCH = 1500;
@@ -81,11 +83,19 @@ public class GuardService extends AccessibilityService {
         return t;
     });
 
+    private static final ExecutorService NODE_EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "netgate-node");
+        t.setDaemon(true);
+        return t;
+    });
+
     private final java.util.Random rnd = new java.util.Random();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable ticker = this::onTick;
 
     private static GuardService instance;
+    /** 最近一次巡检的时间戳，用于判断无障碍是不是被系统「假活着」。 */
+    private static volatile long lastBeat;
 
     private WindowManager wm;
     private ConnectivityManager cm;
@@ -105,6 +115,11 @@ public class GuardService extends AccessibilityService {
     private long noVpnSince;
     /** 正在为「恢复被禁用应用」做一次真探，避免并发重复探。 */
     private boolean restoreChecking;
+    /** 上一次 tick 时 VPN 是否存在，用于捕捉重连边沿。 */
+    private boolean lastVpnSeen;
+    /** 上次取出口指纹的时间。 */
+    private long lastExitAt;
+    private boolean exitRunning;
     private String currentPkg = "";
     private int failStreak;
     private long nextProbeAt;
@@ -120,6 +135,7 @@ public class GuardService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
+        lastBeat = System.currentTimeMillis();
         destroyed = false;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
@@ -187,6 +203,14 @@ public class GuardService extends AccessibilityService {
             return;
         }
         noVpnSince = 0;
+
+        // 只有被单独指定走固定节点的应用才受这一关约束
+        if (Prefs.nodeBound(this, pkg) && NodeLock.verdict(this) == NodeLock.BLOCK) {
+            Diag.log("节点不符 · " + NodeLock.blockDetail(this));
+            block(pkg, R_NODE, NodeLock.blockDetail(this), STYLE_SHEET);
+            return;
+        }
+
         if (!Prefs.probe(this)) return;
         if (!probeRunning) {
             nextProbeAt = 0;
@@ -203,6 +227,7 @@ public class GuardService extends AccessibilityService {
 
     private void onTick() {
         if (destroyed) return;
+        lastBeat = System.currentTimeMillis();
         Diag.heartbeat();
 
         long now = System.currentTimeMillis();
@@ -228,9 +253,26 @@ public class GuardService extends AccessibilityService {
         boolean vpn = NetworkGate.hasVpn(this);
         if (vpn) {
             noVpnSince = 0;
+            if (!lastVpnSeen) {
+                // 通道刚重建：节点可能已经换了，出口指纹必须重取
+                NodeLock.reset();
+                lastExitAt = 0;
+                Diag.log("VPN 通道建立 · 重新读取出口");
+            }
         } else if (noVpnSince == 0) {
             noVpnSince = now;
+            NodeLock.reset();
             Diag.log("VPN 通道消失 · 进入宽限期");
+        }
+        lastVpnSeen = vpn;
+
+        // 出口指纹：前台时勤一点（节点切了要尽快拦），后台降频省流量
+        if (vpn && Prefs.nodeActive(this)) {
+            long gap = active ? 10000 : 60000;
+            if (!exitRunning && now - lastExitAt >= gap) {
+                lastExitAt = now;
+                refreshExit();
+            }
         }
 
         boolean grace = !vpn && now - noVpnSince < NOVPN_GRACE;
@@ -420,6 +462,22 @@ public class GuardService extends AccessibilityService {
         }
 
         if (p.ok) {
+            // 连通性没问题，再看节点对不对：节点不符是一票否决，
+            // 不需要连续失败，确认一次就关。
+            if (Prefs.nodeBound(this, pkg) && NodeLock.verdict(this) == NodeLock.BLOCK) {
+                failStreak = 0;
+                nextProbeAt = now + Prefs.probeDelay(this);
+                boolean fg = pkg != null && pkg.equals(currentPkg)
+                        && Prefs.guarded(this).contains(pkg)
+                        && !SysApps.isCritical(this, pkg);
+                Diag.log("节点不符 · " + NodeLock.blockDetail(this)
+                        + " · 前台 = " + fg);
+                if (fg && !blocking) {
+                    block(pkg, R_NODE, NodeLock.blockDetail(this), STYLE_SHEET);
+                }
+                return;
+            }
+
             boolean wasFail = failStreak > 0;
             failStreak = 0;
             nextProbeAt = now + Prefs.probeDelay(this);
@@ -455,6 +513,47 @@ public class GuardService extends AccessibilityService {
         maybeSweep(Prefs.guarded(this), now, true);
     }
 
+    // -------------------------------------------------------------- 节点锁
+
+    private void refreshExit() {
+        if (exitRunning || destroyed) return;
+        exitRunning = true;
+        NODE_EXEC.execute(() -> {
+            NodeLock.Exit e = null;
+            try {
+                e = NodeLock.refresh(this);
+            } catch (Throwable ignored) {
+            }
+            final boolean got = e != null;
+            main.post(() -> {
+                exitRunning = false;
+                if (destroyed) return;
+                if (got) applyNodeState();
+            });
+        });
+    }
+
+    /**
+     * 出口变了之后立刻判一次。
+     *
+     * 节点不符和「网络不通」是两件事：后者要连续失败才算数，前者是稳定状态，
+     * 一旦确认就该关，不需要等第二次采样。
+     */
+    private void applyNodeState() {
+        if (!Prefs.nodeActive(this)) return;
+        if (NodeLock.verdict(this) != NodeLock.BLOCK) return;
+
+        String pkg = currentPkg;
+        if (pkg == null || pkg.isEmpty()) return;
+        if (!Prefs.nodeBound(this, pkg)) return;
+        if (!Prefs.guarded(this).contains(pkg)) return;
+        if (SysApps.isCritical(this, pkg)) return;
+        if (blocking) return;
+
+        Diag.log("节点不符 · " + NodeLock.blockDetail(this));
+        block(pkg, R_NODE, NodeLock.blockDetail(this), STYLE_SHEET);
+    }
+
     // ---------------------------------------------------------------- 拦截
 
     private void block(final String pkg, final int reason, final String detail) {
@@ -464,7 +563,9 @@ public class GuardService extends AccessibilityService {
     private void block(final String pkg, final int reason, final String detail,
                        final int style) {
         long now = System.currentTimeMillis();
-        Diag.log("拦截 " + pkg + " · " + (reason == R_UNREACHABLE ? "网络不通" : "无 VPN")
+        String why = reason == R_NODE ? "节点不符"
+                : (reason == R_UNREACHABLE ? "网络不通" : "无 VPN");
+        Diag.log("拦截 " + pkg + " · " + why
                 + (style == STYLE_BANNER ? " · 横条" : " · 弹窗"));
         pendingRecover = true;
 
@@ -586,21 +687,29 @@ public class GuardService extends AccessibilityService {
         glp.bottomMargin = dp(15);
         card.addView(grab, glp);
 
+        boolean node = reason == R_NODE;
         FrameLayout ico = new FrameLayout(this);
-        ico.setBackground(Ui.grad(0xFFFFF1EF, 0xFFFFE8E5, 100, this));
+        ico.setBackground(node
+                ? Ui.grad(0xFFFFF6E5, 0xFFFFEBCF, 100, this)
+                : Ui.grad(0xFFFFF1EF, 0xFFFFE8E5, 100, this));
         Glyph tri = new Glyph(this);
-        tri.type(Glyph.TRI).color(Ui.RED_DEEP).weight(2.1f);
+        tri.type(node ? Glyph.SHIELD : Glyph.TRI)
+                .color(node ? Ui.AMBER_DEEP : Ui.RED_DEEP).weight(2.1f);
         ico.addView(tri, new FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER));
         card.addView(ico, new LinearLayout.LayoutParams(dp(48), dp(48)));
 
-        TextView title = Ui.text(this, "已阻止打开 " + label, 16, Ui.INK, true);
+        TextView title = Ui.text(this,
+                node ? "节点不符合" : "已阻止打开 " + label, 16, Ui.INK, true);
         title.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-2, -2);
         tp.topMargin = dp(10);
         card.addView(title, tp);
 
         String msgText;
-        if (reason == R_UNREACHABLE) {
+        if (node) {
+            msgText = label + " 已退出。节点锁只允许 " + Prefs.nodeLabel(this) + "，\n"
+                    + "当前连的不是这个地区，即使网络通畅也不会放行。";
+        } else if (reason == R_UNREACHABLE) {
             msgText = "网络校验没通过，" + (detail == null ? "检测目标无响应" : detail) + "。\n"
                     + "连上加速器后会自动放行。";
         } else {
@@ -616,13 +725,26 @@ public class GuardService extends AccessibilityService {
         LinearLayout why = new LinearLayout(this);
         why.setOrientation(LinearLayout.HORIZONTAL);
         why.setGravity(Gravity.CENTER_VERTICAL);
-        why.setBackground(Ui.gradStroke(0xFFFCF8F8, 0xFFF8F2F2, 11, 0.5f, 0x17E8332A, this));
+        why.setBackground(node
+                ? Ui.gradStroke(0xFFFFFBF3, 0xFFFFF6E8, 11, 0.5f, 0x22D98200, this)
+                : Ui.gradStroke(0xFFFCF8F8, 0xFFF8F2F2, 11, 0.5f, 0x17E8332A, this));
         why.setPadding(dp(11), dp(10), dp(11), dp(10));
-        TextView w1 = Ui.text(this, "最近一次校验", 12, 0xFF8E8E96, false);
-        String right = reason == R_UNREACHABLE
-                ? (detail == null ? "全部超时" : detail)
-                : "未检测到 VPN 通道";
-        TextView w2 = Ui.text(this, right, 12, Ui.RED_DEEP, true);
+        TextView w1 = Ui.text(this, node ? "当前出口" : "最近一次校验",
+                12, 0xFF8E8E96, false);
+        String right;
+        int tone;
+        if (node) {
+            NodeLock.Exit e = NodeLock.cached();
+            right = e == null ? "节点未知" : e.tag();
+            tone = Ui.AMBER_DEEP;
+        } else if (reason == R_UNREACHABLE) {
+            right = detail == null ? "全部超时" : detail;
+            tone = Ui.RED_DEEP;
+        } else {
+            right = "未检测到 VPN 通道";
+            tone = Ui.RED_DEEP;
+        }
+        TextView w2 = Ui.text(this, right, 12, tone, true);
         w2.setSingleLine(true);
         w2.setEllipsize(TextUtils.TruncateAt.END);
         w2.setGravity(Gravity.END);
@@ -631,6 +753,9 @@ public class GuardService extends AccessibilityService {
         LinearLayout.LayoutParams whp = new LinearLayout.LayoutParams(-1, -2);
         whp.topMargin = dp(15);
         card.addView(why, whp);
+
+        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, dp(44));
+        bp.topMargin = dp(14);
 
         TextView btn = new TextView(this);
         btn.setText("知道了");
@@ -641,8 +766,6 @@ public class GuardService extends AccessibilityService {
         btn.setBackground(softButton());
         btn.setClickable(true);
         btn.setOnClickListener(v -> dismiss());
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, dp(44));
-        bp.topMargin = dp(14);
         card.addView(btn, bp);
 
         TextView status = Ui.text(this,
@@ -654,7 +777,9 @@ public class GuardService extends AccessibilityService {
         card.addView(status, sp);
         overlayStatus = status;
 
-        TextView hint = Ui.text(this, "点开应用时会自动再校验一次", 11, 0xFF9C9CA6, false);
+        TextView hint = Ui.text(this,
+                node ? "换到允许的节点后重新打开即可" : "点开应用时会自动再校验一次",
+                11, 0xFF9C9CA6, false);
         hint.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams hp = new LinearLayout.LayoutParams(-2, -2);
         hp.topMargin = dp(6);
@@ -749,6 +874,11 @@ public class GuardService extends AccessibilityService {
                 WindowManager.LayoutParams.WRAP_CONTENT);
         lp.gravity = Gravity.TOP;
         lp.y = statusBarHeight() + dp(8);
+        // 横条只是通知，不能吃掉背后应用的触摸。
+        // 少了这两个 flag，窗口是 touch-modal 的：屏幕任何位置的点击都会变成
+        // 该窗口的 ACTION_OUTSIDE 被丢弃，用户必须先关掉横条才能继续操作。
+        lp.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
 
         final long stamp = ++bannerStamp;
         try {
@@ -871,6 +1001,18 @@ public class GuardService extends AccessibilityService {
 
     @Override
     public void onInterrupt() {
+    }
+
+    /**
+     * 无障碍是否真的在跑。
+     *
+     * 只看 instance 不够：ColorOS 会冻结进程但保留服务记录，tick 早就不走了。
+     * 所以还要求 15 秒内有过心跳，超时即视为掉线，让 Shizuku 通道接管。
+     */
+    public static boolean alive() {
+        GuardService s = instance;
+        return s != null && !s.destroyed
+                && System.currentTimeMillis() - lastBeat < 15000;
     }
 
     @Override
